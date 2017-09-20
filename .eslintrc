@@ -1,0 +1,16 @@
+{
+  # "extends": "eslint:recommended",
+
+  "env": {
+    "node": true
+  },
+
+  "parserOptions": {
+    "ecmaVersion": 8
+  },
+
+  "rules": {
+    # "semi": "always",
+    "no-console": 0
+  }
+}

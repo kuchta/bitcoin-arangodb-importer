@@ -1,0 +1,19 @@
+{
+  "name": "bitcoin-arangodb-importer",
+  "version": "0.0.1",
+  "description": "Bitcoin ArangoDB importer",
+  "author": "Mila Kuchta <mila.kuchta@gmail.com>",
+  "license": "ISC",
+  "main": "index.js",
+  "scripts" : {
+    "start" : "node index.js -h"
+  },
+  "dependencies": {
+    "arangojs": "^5.7.0",
+    "bitcoin-core": "^1.2.0",
+    "moment": "^2.18.1"
+  },
+  "devDependencies": {
+    "eslint": "^4.6.1"
+  }
+}
