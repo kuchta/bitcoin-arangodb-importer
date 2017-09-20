@@ -66,8 +66,8 @@ let numAddresses = 0;
 const client = new Client(config.bitcoinRPC);
 
 const db = new arangojs.Database({
-  url: `http://${config.database.username}:${config.database.password}@${config.database.host}:${config.database.port}`,
-  databaseName: 'bitcoin'
+    url: `http://${config.database.username}:${config.database.password}@${config.database.host}:${config.database.port}`,
+    databaseName: config.database.database
 });
 
 (async function run() {
