@@ -6,56 +6,32 @@ const util = require('util');
 
 const setImmediatePromise = util.promisify(setImmediate);
 
-const program = require('commander');
-// const winston = require('winston');
+const commander = require('commander');
 const moment = require('moment');
 
 const Client = require('bitcoin-core');
 const arangojs = require('arangojs');
 
+const { MyError, arangoErrors } = require('./errors');
 const config = require('./config');
 
-program
+commander
     .version('0.0.1')
     .option('-c, --clean', 'Clean database before import')
     .option('-v, --verbose', 'Increase verbosity', (v, total) => total + 1, 0)
-    .option('-d, --debug', 'Increase verbosity of debug messages', (v, total) => total + 1, 0)
+    .option('-d, --debug', 'Increase verbosity of debug messages', (v, total) => total + 1, 3)
+    .option('-r, --retry <n>', 'Number of retries in case of conflict', parseInt)
     .parse(process.argv);
 
-process.on('exit', exitHandler('exit'));
-process.on('SIGINT', exitHandler('int'));
-process.on('uncaughtException', exitHandler('uncaughtException'));
-process.on('unhandledRejection', exitHandler('unhandledRejection'));
-process.on('rejectionHandled', exitHandler('rejectionHandled'));
-
-class MyError extends Error {
-    constructor(message, object) {
-        super(message);
-        this.object = object;
-
-        let lines = this.stack.split('\n');
-        lines.splice(0,1);
-        this.stack = lines.join('\n');
-    }
-
-    toString() {
-        return this.message;
-    }
-}
-
-const arangoErrors = {
-    ERROR_ARANGO_CONFLICT: { code: 1200 },
-    ERROR_ARANGO_UNIQUE_CONSTRAINT_VIOLATED: { code: 1210 }
-}
-
-const logger = {
-    debug: (...args) => logMessage('info', ...args),
-    info: (...args) => logMessage('info', ...args),
-    warning: (...args) => logMessage('warn', ...args),
-    error: (...args) => logMessage('error', ...args)
-};
+const logger = require('./logger')(commander.verbose, commander.debug);
 
 const unhandledRejections = new Map();
+
+process.on('exit', handleExit);
+// process.on('SIGINT', exitHandler('int'));
+process.on('uncaughtException', handleExceptions('uncaughtException'));
+process.on('unhandledRejection', handleExceptions('unhandledRejection'));
+process.on('rejectionHandled', handleExceptions('rejectionHandled'));
 
 const startTime = moment();
 let numBlocks = 0;
@@ -70,22 +46,40 @@ const db = new arangojs.Database({
     databaseName: config.database.database
 });
 
+const BLOCKS = {
+    name: 'blocks',
+    handle: db.collection('blocks'),
+    entity: 'block',
+};
+
+const TRANSACTIONS = {
+    name: 'transactions',
+    handle: db.collection('transactions'),
+    entity: 'transaction',
+};
+
+const ADDRESSES = {
+    name: 'addresses',
+    handle: db.collection('addresses'),
+    entity: 'address'
+};
+
 (async function run() {
-    if (program.clean) {
+    if (commander.clean) {
         logger.info('Cleaning database');
         await db.truncate();
         logger.info('Database cleaned');
     } else {
         await Promise.all([
-            getOrCreateCollection('blocks'),
-            getOrCreateCollection('transactions'),
-            getOrCreateCollection('addresses')
+            getOrCreateCollection(BLOCKS),
+            getOrCreateCollection(TRANSACTIONS),
+            getOrCreateCollection(ADDRESSES)
         ]);
 
         let block;
         let blockHash;
 
-        if ((await countDocuments('blocks')).count > 0) {
+        if ((await countDocuments(BLOCKS)).count > 0) {
             const cursor = await db.query(
                 'FOR b IN blocks ' +
                 'SORT b.height DESC ' +
@@ -108,10 +102,10 @@ const db = new arangojs.Database({
 
         while (blockHash) {
             block = await client.getBlock(blockHash, 2);
-            // if (Math.round(block.height / bestBlockHeight) !== progress) {
-            //     progress = Math.round(block.height / bestBlockHeight);
-            //     logger.info(`Progress: ${progress * 100}%`);
-            // }
+            if (Math.round(block.height / bestBlockHeight) !== progress) {
+                progress = Math.round(block.height / bestBlockHeight);
+                logger.info(`Progress: ${progress * 100}%`);
+            }
             await processBlock(block);
             blockHash = block.nextblockhash ? block.nextblockhash : null;
         }
@@ -121,9 +115,7 @@ const db = new arangojs.Database({
 // Bussiness logic
 
 async function processBlock(block) {
-    if (program.verbose <= 0) {
-        logger.info(`Processing block #${block.height} containing ${block.tx.length} transactions`);
-    }
+    logger.info1(`Processing block #${block.height} containing ${block.tx.length} transactions`);
 
     await Promise.all(block.tx.map((transaction) => processTransaction(transaction, block)));
 
@@ -134,23 +126,15 @@ async function processBlock(block) {
         tx: block.tx.map((tx) => tx.txid)
     };
 
-    try {
-        await saveOrReplaceDocument('blocks', document);
-    } catch (error) {
-        throw new MyError(`Creating block failed: ${block.hash}: ${error.name}: ${error.messsage}`, document);
-    }
+    await saveOrReplaceDocument(BLOCKS, document);
 
     numBlocks++;
 
-    if (program.verbose >= 4) {
-        logger.info(`Done processing block #${block.height}`);
-    }
+    logger.info4(`Done processing block #${block.height}`);
 }
 
 async function processTransaction(transaction, block) {
-    if (program.verbose >= 2) {
-        logger.info(`Processing transaction: ${transaction.txid}`);
-    }
+    logger.info2(`Processing transaction: ${transaction.txid}`);
 
     if (transaction.vin[0].hasOwnProperty('coinbase')) {
         if (transaction.vin.length !== 1) {
@@ -165,54 +149,46 @@ async function processTransaction(transaction, block) {
         blockhash: block.hash,
     };
 
-    try {
-        await saveOrReplaceDocument('transactions', document);
-    } catch (error) {
-        throw new MyError(`Creating transaction failed: ${transaction.txid}: ${error.name}: ${error.message}`, document);
-    }
+    await saveOrReplaceDocument(TRANSACTIONS, document);
 
     numTransactions++;
 
-    if (program.verbose >= 4) {
-        logger.info(`Done processing transaction: ${transaction.txid}`);
-    }
+    logger.info4(`Done processing transaction: ${transaction.txid}`);
 }
 
 async function processOutput(output, transaction, block) {
-    if (program.verbose >= 4) {
-        logger.info(`Processing output #${output.n} in transaction ${transaction.txid}`);
-    }
+    logger.info4(`Processing output #${output.n} in transaction ${transaction.txid}`);
 
     if (!output.hasOwnProperty('scriptPubKey')) {
-        throw new MyError(`No scriptPubKey in output #${output.n} in transaction ${transaction}`);
+        throw new MyError(`No scriptPubKey in output #${output.n} in transaction ${transaction.txid}`, transaction);
     }
 
     if (!output.scriptPubKey.hasOwnProperty('addresses')) {
-        throw new MyError(`No addresses in output #${output.n} in transaction ${transaction}`);
+        logger.warning(`No addresses in output #${output.n} in transaction ${transaction.txid}`, transaction);
+        return;
     }
 
-    if (output.scriptPubKey.addresses > 1) {
-        logger.warning(`Unexpected number of addresses in output #${output.n} in transaction ${transaction}`);
+    if (output.scriptPubKey.addresses.length > 1) {
+        logger.warning(`Unexpected number of addresses in output #${output.n} in transaction ${transaction.txid}`, transaction);
     } else if (output.scriptPubKey.addresses < 1) {
-        throw new MyError(`No addresses in output #${output.n}`);
+        logger.warning(`No addresses in output #${output.n} in transaction ${transaction.txid}`, transaction);
     }
 
     await Promise.all(output.scriptPubKey.addresses.map((address) => processAddress(address, output, transaction, block)));
 
     numOutputs++;
 
-    if (program.verbose >= 4) {
-        logger.info(`Done processing output #${output.n} in transaction ${transaction.txid}`);
-    }
+    logger.info4(`Done processing output #${output.n} in transaction ${transaction.txid}`);
 }
 
 async function processAddress(address, output, transaction, block) {
-    if (program.verbose >= 3) {
-        logger.info(`Processing address ${address} in output #${output.n} in transaction ${transaction.txid}`);
-    }
+    logger.info3(`Processing address ${address} in output #${output.n} in transaction ${transaction.txid}`);
 
     try {
-        await db.transaction({read: ['addresses'], write: ['addresses']}, transactionStr, { address, output, transaction, block });
+        let params = { address, value: output.value, output: output.n, transactionId: transaction.txid };
+        // console.log(transactionStr);
+        // console.log(params);
+        await db.transaction({read: ['addresses'], write: ['addresses']}, transactionStr, params);
     } catch (error) {
         if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_CONFLICT.code) {
             logger.warning(`Creating address failed: ${address}: ${error.name}: ${error.message}. Retrying...`);
@@ -229,77 +205,47 @@ async function processAddress(address, output, transaction, block) {
 
     numAddresses++;
 
-    if (program.verbose >= 4) {
-        logger.info(`Done processing address ${address} in output #${output.n} in transaction ${transaction.txid}`);
-    }
+    logger.info4(`Done processing address ${address} in output #${output.n} in transaction ${transaction.txid}`);
 }
 
-const transactionStr = String(function (params) {
-    const arangodb = require('@arangodb');
-    const arangoErrors = arangodb.errors;
-    const addresses = arangodb.db._collection('addresses');
+const transactionStr = `
+function run({address, value, output, transactionId }) {
+${MyError}
+${saveOrUpdateDocumentSync}
+${saveDocumentSync}
+${updateDocumentSync}
+${modifyCollectionSync}
+const arangodb = require('@arangodb');
+const arangoErrors = arangodb.errors;
+const logger = console;
+logger.warning = console.warn;
+const ADDRESSES = {
+    name: 'addresses',
+    handle: arangodb.db._collection('addresses'),
+    entity: 'address'
+}
 
-    function saveAddress(addressesCol, txId, outputId, address, value) {
-        return addressesCol.save({
-            _key: address,
-            [txId]: {
-                [outputId]: value
-            }
-        });
+saveOrUpdateDocumentSync(ADDRESSES, {
+    _key: address,
+    [transactionId]: {
+        [output]: value
     }
-
-    function updateAddress(addressesCol, txId, outputId, address, value) {
-        return addressesCol.update(address, {
-            [txId]: {
-                [outputId]: value
-            }
-        });
-    }
-
-    function saveOrUpdate(addressesCol, txId, outputId, address, value) {
-        try {
-            const document = addressesCol.document(address);
-            if (!document.hasOwnProperty('transactions')
-                    || !document.transactions.hasOwnProperty(txId)
-                    || !document.transactions[txId].hasOwnProperty(outputId)
-                    || document.transactions[txId][outputId] !== value) {
-
-                    return updateAddress(addressesCol, txId, outputId, address, value);
-            }
-        } catch (error) {
-            if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_DOCUMENT_NOT_FOUND.code) {
-                return saveAddress(addressesCol, txId, outputId, address, value);
-            } else {
-                throw error;
-            }
-        }
-    }
-
-    return saveOrUpdate(addresses, params.transaction.txid, params.output.n, params.address, params.output.value);
 });
+}`
 
 // Database logic
 
 async function getOrCreateCollection(collection) {
-    const col = db.collection(collection);
     try {
-        await col.get();
+        await collection.handle.get();
     } catch (error) {
-        logger.info(`Creating collection: ${collection}`);
+        logger.info(`Creating collection: ${collection.name}`);
         try {
-            col.create();
+            collection.handle.create();
         } catch (error) {
-            throw new MyError(`Creating collection failed: ${collection}: ${error.message}`);
+            throw new MyError(`Creating collection failed: ${collection.name}: ${error.message}`);
         }
     }
-}
-
-function countDocuments(collection) {
-    return db.collection(collection).count();
-}
-
-function getDocument(collection, docId) {
-    return db.collection(collection).document(documentId);
 }
 
 async function saveOrReplaceDocument(collection, document) {
@@ -307,34 +253,103 @@ async function saveOrReplaceDocument(collection, document) {
         return await saveDocument(collection, document);
     } catch (error) {
         if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_UNIQUE_CONSTRAINT_VIOLATED.code) {
-            logger.warning(`Creating document failed: ${document._key}: ${error.name}: ${error.messsage}. Replacing...`, document);
-            return await replaceDocument(collection, document._key, document);
+            logger.warning(`Saving ${collection.entity} failed: ${document._key}: ${error.name}: ${error.messsage}. Replacing...`, document);
+            try {
+                return await replaceDocument(collection, document._key, document);
+            } catch (error) {
+                throw new MyError(`Replacing ${collection.entity} failed: ${document._key}: ${error.name}: ${error.messsage}`, document);
+            }
+        } else {
+            throw new MyError(`Saving ${collection.entity} failed: ${document._key}: ${error.name}: ${error.messsage}`, document);
+        }
+    }
+}
+
+async function saveOrUpdateDocument(collection, document) {
+    try {
+        return await saveDocument(collection, document);
+    } catch (error) {
+        if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_UNIQUE_CONSTRAINT_VIOLATED.code) {
+            logger.warning(`Saving ${collection.entity} failed: ${document._key}: ${error.name}: ${error.messsage}. Updating...`, document);
+            try {
+                return await updateDocument(collection, document._key, document);
+            } catch (error) {
+                throw new MyError(`Updating ${collection.entity} failed: ${document._key}: ${error.name}: ${error.messsage}`, document);
+            }
+        } else {
+            throw new MyError(`Saving ${collection.entity} failed: ${document._key}: ${error.name}: ${error.messsage}`, document);
+        }
+    }
+}
+
+function saveOrUpdateDocumentSync(collection, document) {
+    try {
+        return saveDocumentSync(collection, document);
+    } catch (error) {
+        if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_UNIQUE_CONSTRAINT_VIOLATED.code) {
+            try {
+                return updateDocumentSync(collection, document._key, document);
+            } catch (error) {
+                throw new MyError(`Updating ${collection.entity} failed: ${document._key}: ${error.name}: ${error.messsage}`, document);
+            }
+        } else {
+            throw new MyError(`Saving ${collection.entity} failed: ${document._key}: ${error.name}: ${error.messsage}`, document);
+        }
+    }
+}
+
+function countDocuments(collection) {
+    return collection.handle.count();
+}
+
+function getDocument(collection, docId) {
+    return collection.handle.document(documentId);
+}
+
+function saveDocument(collection, document) {
+    return modifyCollection(collection, 'save', commander.retries, document);
+}
+
+function saveDocumentSync(collection, document) {
+    return modifyCollectionSync(collection, 'save', 3, document);
+}
+
+function replaceDocument(collection, documentId, document) {
+    return modifyCollection(collection, 'replace', commander.retries, documentId, document);
+}
+
+function replaceDocumentSync(collection, documentId, document) {
+    return modifyCollection(collection, 'replace', 3, documentId, document);
+}
+
+function updateDocument(collection, documentId, document) {
+    return modifyCollection(collection, 'update', commander.retries, documentId, document);
+}
+
+function updateDocumentSync(collection, documentId, document) {
+    return modifyCollectionSync(collection, 'update', 3, documentId, document);
+}
+
+async function modifyCollection(collection, operation, retries, ...args) {
+    // console.log(`modifyCollection(collection=${collection}, operation=${operation}, args=${args}`);
+    try {
+        return await collection.handle[operation](...args);
+    } catch (error) {
+        if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_CONFLICT.code && retries > 0) {
+            await setImmediatePromise();
+            return await modifyCollection(collection, operation, retries-1, ...args);
         } else {
             throw error;
         }
     }
 }
 
-async function saveDocument(collection, document) {
+function modifyCollectionSync(collection, operation, retries=1, ...args) {
     try {
-        return await db.collection(collection).save(document);
+        return collection.handle[operation](...args);
     } catch (error) {
-        if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_CONFLICT.code) {
-            await setImmediatePromise();
-            return await db.collection(collection).save(document);
-        } else {
-            throw error;
-        }
-    }
-}
-
-async function replaceDocument(collection, documentId, document) {
-    try {
-        return await db.collection(collection).replace(documentId, document);
-    } catch (error) {
-        if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_CONFLICT.code) {
-            await setImmediatePromise();
-            return await db.collection(collection).save(document);
+        if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_CONFLICT.code && retries <= 3) {
+            setTimeout(() => modifyCollectionSync(collection, operation, retries+1, ...args), 0);
         } else {
             throw error;
         }
@@ -343,85 +358,39 @@ async function replaceDocument(collection, documentId, document) {
 
 // Error handling
 
-
-
-function exitHandler(error) {
-    return function (...args) {
-        if (program.debug >= 3) {
-            logger.debug(`exitHandler(${error}, ${args})`);
+function handleExceptions(type) {
+    if (type === 'uncaughtException') {
+        return (error) => {
+            logger.error(`uncaughtException: ${error}`, error);
+            process.exit(1);
         }
-
-        if (error === 'unhandledRejection') {
-            if (program.debug >= 2) {
-                logger.debug(`unhandledRejection: ${args}`);
-            }
-            unhandledRejections.set(args[1], args[0]);
-        } else if (error === 'rejectionHandled') {
-            if (program.debug >= 2 ) {
-                logger.debug(`rejectionHandled: ${args}`);
-            }
+    } else if (type == 'unhandledRejection') {
+        return (error, promise) => {
+            unhandledRejections.set(promise, error);
+        }
+    } else if (type == 'rejectionHandled') {
+        return (promise) => {
             unhandledRejections.delete(args[0]);
-        } else {
-            let ret = 0;
-
-            if (unhandledRejections.size > 0) {
-                if (program.debug >= 2) {
-                    logger.error('unhandledRejections:');
-                }
-                for (let [key, value] of unhandledRejections) {
-                    logger.error(value);
-                }
-                ret = 1;
-            }
-
-            if (error === 'uncaughtException') {
-                if (program.debug >= 2) {
-                    logger.error('uncaughtException:');
-                }
-                logger.error(args[0]);
-                ret = 1;
-            }
-
-            if (numBlocks + numTransactions + numOutputs > 0) {
-                const duration = moment.duration(moment().diff(startTime));
-                logger.info(`Processed ${numBlocks} blocks, ` +
-                    `${numTransactions} transactions, ` +
-                    `${numOutputs} outputs and ` +
-                    `${numAddresses} addresses in ` +
-                    `${moment.utc(duration.asMilliseconds()).format("HH:mm:ss")}`);
-            }
-
-            process.exit(ret);
         }
     }
 }
 
-// Logging
-
-function logMessage(level, message, object) {
-    let stack;
-
-    if (typeof message !== 'string' && typeof message === 'object') {
-        if (message instanceof Error) {
-            if (object === undefined) {
-                object = message.object;
-            }
-
-            stack = message.stack;
+function handleExit(code) {
+    if (unhandledRejections.size > 0) {
+        for (let [key, value] of unhandledRejections) {
+            logger.error(`unhandledRejection: ${value}`, value);
         }
-
-        message = message.toString();
+        if (code === 0) {
+            process.exit(1);
+        }
     }
 
-    if (message) {
-        console[level](message);
-    }
-
-    if (program.debug >= 1 && object) {
-        console[level](JSON.stringify(object, null, 4));
-    }
-
-    if (program.debug >= 1 && stack) {
-        console[level](stack);
+    if (numBlocks + numTransactions + numOutputs > 0) {
+        const duration = moment.duration(moment().diff(startTime));
+        logger.info(`Processed ${numBlocks} blocks, ` +
+            `${numTransactions} transactions, ` +
+            `${numOutputs} outputs and ` +
+            `${numAddresses} addresses in ` +
+            `${moment.utc(duration.asMilliseconds()).format("HH:mm:ss")}`);
     }
 }
