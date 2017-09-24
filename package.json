@@ -9,13 +9,14 @@
     "start": "node index.js -h"
   },
   "dependencies": {
+    "arangojs": "^5.7.0",
+    "bitcoin-core": "^1.2.0",
     "commander": "^2.11.0",
     "moment": "^2.18.1",
-    "winston": "^2.3.1",
-    "bitcoin-core": "^1.2.0",
-    "arangojs": "^5.7.0"
+    "winston": "^2.3.1"
   },
   "devDependencies": {
-    "eslint": "^4.6.1"
+    "happiness": "^10.0.2",
+    "standard": "^10.0.3"
   }
 }
