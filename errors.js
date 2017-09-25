@@ -1,11 +1,11 @@
 class MyError extends Error {
-	constructor (message, {error = null, object = null} = {}) {
+	constructor(message, { error = null , object = null } = {} ) {
 		super(message);
 		this.error = error;
 		this.object = object;
 	}
 
-	toString () {
+	toString() {
 		return this.message;
 	}
 }
@@ -17,4 +17,4 @@ const arangoErrors = {
 
 module.exports = {
 	MyError,
-	arangoErrors};
+arangoErrors};

@@ -38,7 +38,7 @@ const config = {
 			depth: 5,
 			stderrLevels: ['error', 'warning'],
 			formatter: null
-			// align: true
+		// align: true
 		})
 	]
 };
@@ -50,8 +50,8 @@ function removeFirstLine (string) {
 }
 
 function logMessage (verbose, debug, logger, level) {
-	return (message, {error = null, object = null} = {}) => {
-    // console.log(`message=${message}, error=${error}, object=${object}`)
+	return (message, { error = null , object = null } = {}) => {
+		// console.log(`message=${message}, error=${error}, object=${object}`)
 		let stack;
 		if (error instanceof Error) {
 			if (error instanceof MyError) {
