@@ -54,22 +54,21 @@ function logMessage (verbose, debug, logger, level) {
 		// console.log(`message=${message}, error=${error}, object=${object}`)
 		let stack;
 		if (error instanceof Error) {
+			stack = error.stack;
 			if (error instanceof MyError) {
-				stack = error.stack;
 				if (message) {
 					message = `${message}: ${error.toString()}`;
 				} else {
 					message = error.toString();
 				}
 				if (error.error) {
-					stack = error.error.stack;
+					// stack = error.error.stack;
 					message = `${message}: ${error.error.toString()}`;
 				}
 				if (!object && error.object) {
 					object = error.object;
 				}
 			} else {
-				stack = error.stack;
 				if (message) {
 					message = `${message}: ${error.toString()}`;
 				} else {

@@ -9,9 +9,10 @@ const setImmediatePromise = util.promisify(setImmediate);
 
 const commander = require('commander');
 const moment = require('moment');
+const _ = require('lodash');
 
 const Client = require('bitcoin-core');
-const {Database} = require('arangojs');
+const {Database, aql} = require('arangojs');
 
 const { MyError, arangoErrors } = require('./errors');
 const config = require('./config');
@@ -31,20 +32,21 @@ const logger = require('./logger')(commander.verbose, commander.debug);
 
 const unhandledRejections = new Map();
 
+const startTime = moment();
+let bestBlockHeight;
+let progress;
+let blocksCounter = 0;
+let blocksLapTime = moment();
+let transactionsCounter = 0;
+let transactionsLapTime = moment();
+let outputsCounter = 0;
+let stop = false;
+
 process.on('exit', handleExit);
 process.on('SIGINT', handleInt);
 process.on('uncaughtException', handleExceptions('uncaughtException'));
 process.on('unhandledRejection', handleExceptions('unhandledRejection'));
 process.on('rejectionHandled', handleExceptions('rejectionHandled'));
-
-const perfEmitter = new EventEmitter();
-
-const startTime = moment();
-let numBlocks = 0;
-let numTransactions = 0;
-let numOutputs = 0;
-let numAddresses = 0;
-let stop = false;
 
 const client = new Client(config.bitcoinRPC);
 
@@ -56,19 +58,48 @@ const db = new Database({
 const BLOCKS = {
 	name: 'blocks',
 	entity: 'block',
-	handle: db.collection('blocks')
+	handle: db.collection('blocks'),
+	get: 'document'
 };
 
 const TRANSACTIONS = {
 	name: 'transactions',
 	entity: 'transaction',
-	handle: db.collection('transactions')
+	handle: db.collection('transactions'),
+	get: 'document'
+};
+
+const OUTPUTS = {
+	name: 'outputs',
+	entity: 'output',
+	handle: db.collection('outputs'),
+	get: 'document'
 };
 
 const ADDRESSES = {
 	name: 'addresses',
 	entity: 'address',
-	handle: db.collection('addresses')
+	handle: db.collection('addresses'),
+	get: 'document'
+};
+
+const OUTPUTS_SPENT_IN	 = {
+	name: 'outputsSpentIn',
+	entity: 'outputSpentIn',
+	handle: db.edgeCollection('outputsSpentIn'),
+	get: 'edge'
+};
+
+const GRAPH = {
+	name: 'graph',
+	handle: db.graph('graph'),
+	properties: {
+		edgeDefinitions: [{
+			collection: OUTPUTS_SPENT_IN.name,
+			from: [OUTPUTS.name],
+			to: [TRANSACTIONS.name]
+		}]
+	}
 };
 
 (async function run () {
@@ -80,8 +111,12 @@ const ADDRESSES = {
 		await Promise.all([
 			getOrCreateCollection(BLOCKS),
 			getOrCreateCollection(TRANSACTIONS),
-			getOrCreateCollection(ADDRESSES)
+			getOrCreateCollection(OUTPUTS),
+			// saveDocument(OUTPUTS, { _key: 'coinbase'} ),
+			getOrCreateCollection(ADDRESSES),
+			getOrCreateCollection(OUTPUTS_SPENT_IN)
 		]);
+		await getOrCreateGraph(GRAPH)
 
 		let block;
 		let blockHash;
@@ -100,32 +135,15 @@ const ADDRESSES = {
 			blockHash = await client.getBlockHash(1);
 		}
 
-		let lapTime = moment();
-
-		if (commander.perf) {
-			perfEmitter.on('1000outputs', () => {
-				logger.info(`1000 transactions in ${moment.duration(moment().diff(lapTime)).asMilliseconds() / 1000} seconds`);
-				lapTime = moment();
-			});
-		}
-
 		const bestBlock = await client.getBlock(await client.getBestBlockHash());
-		const bestBlockHeight = bestBlock.height;
-		let lapBlocks = 0;
-		let lapTransactions = 0;
+		bestBlockHeight = bestBlock.height;
 
 		logger.info(`Best block: ${bestBlockHeight}`);
 		logger.info(`Last known best block: ${block.height}`);
 
 		while (!stop && blockHash) {
 			block = await client.getBlock(blockHash, 2);
-			lapTransactions += await processBlock(block);
-			lapBlocks++;
-			if (lapBlocks >= 1000) {
-				logger.info(`Progress: ${block.height}/${bestBlockHeight} (${Math.round((block.height / bestBlockHeight) * 100)}%) containing ${lapTransactions} transactions`);
-				lapBlocks = 0;
-				lapTransactions = 0;
-			}
+			await processBlock(block);
 			blockHash = block.nextblockhash ? block.nextblockhash : null;
 		}
 	}
@@ -136,51 +154,53 @@ const ADDRESSES = {
 async function processBlock (block) {
 	logger.info1(`Processing block #${block.height} containing ${block.tx.length} transactions`);
 
-	await runProcessorOnList(processTransaction, block.tx, block);
+	await map(processTransaction, block.tx, block);
 
-	let document = {
-		_key: block.hash,
-		height: block.height,
-		time: block.time,
-		tx: block.tx.map((tx) => tx.txid)
-	};
-
-	await saveDocument(BLOCKS, document);
-
-	numBlocks++;
+	saveBlock(block.hash, block.height, block.time, block.tx.map((tx) => tx.txid));
 
 	logger.info4(`Done processing block #${block.height}`);
-
-	return block.tx.length;
 }
 
 async function processTransaction (transaction, block) {
 	logger.info2(`Processing transaction: ${transaction.txid}`);
 
-	if (transaction.vin[0].hasOwnProperty('coinbase')) {
-		if (transaction.vin.length !== 1) {
-			logger.warning(`Coinbase transaction with multiple inputs: ${transaction}`);
-		}
-	}
+	const inputsRet = await map(processInput, transaction.vin, transaction, block);
+	const outputsRet = await map(processOutput, transaction.vout, transaction, block);
 
-	await runProcessorOnList(processOutput, transaction.vout, transaction, block);
+	// logger.debug1('inputsRet', {object: inputsRet});
+	// logger.debug1('outputsRet', {object: outputsRet});
 
-	const document = {
-		_key: transaction.txid,
-		blockhash: block.hash
-	};
-
-	await saveDocument(TRANSACTIONS, document);
-
-	numTransactions++;
+	saveTransaction(transaction.txid, block.hash);
 
 	logger.info4(`Done processing transaction: ${transaction.txid}`);
+}
 
-	return transaction.vout.length;
+async function processInput (input, transaction, block) {
+	logger.info3(`Processing input in transaction ${transaction.txid}`);
+
+	let output;
+	let outputId;
+	if (input.hasOwnProperty('coinbase')) {
+		outputId = `${transaction.txid}:coinbase`;
+		output = await saveOutput(transaction.txid, 'coinbase', getBlockSubsidy(block.height));
+	} else {
+		outputId = `${input.txid}:${input.vout}`;
+		output = await getDocument(OUTPUTS, outputId);
+	}
+
+	if (!output) {
+		logger.warning(`Can't find matching output for input ${outputId}`);
+	} else {
+		saveOutputSpentIn(outputId, transaction.txid);
+	}
+
+	return output.value;
+
+	logger.info4(`Done processing input in transaction ${transaction.txid}`);
 }
 
 async function processOutput (output, transaction, block) {
-	logger.info4(`Processing output #${output.n} in transaction ${transaction.txid}`);
+	logger.info3(`Processing output #${output.n} in transaction ${transaction.txid}`);
 
 	if (!output.hasOwnProperty('scriptPubKey')) {
 		throw new MyError(`No scriptPubKey in output #${output.n} in transaction "${transaction.txid}"`, {object: output});
@@ -188,53 +208,115 @@ async function processOutput (output, transaction, block) {
 
 	if (!output.scriptPubKey.hasOwnProperty('addresses')) {
 		logger.warning(`No addresses in output #${output.n} in transaction "${transaction.txid}"`, {object: output});
-		return;
+	} else {
+		if (output.scriptPubKey.addresses < 1) {
+			logger.warning(`No addresses in output #${output.n} in transaction "${transaction.txid}"`, {object: output});
+		} else {
+			map(saveAddress, output.scriptPubKey.addresses, transaction.txid, output.n);
+		}
 	}
 
-	if (output.scriptPubKey.addresses.length > 1) {
-		logger.warning(`Unexpected number of addresses in output #${output.n} in transaction "${transaction.txid}"`, {object: output});
-	} else if (output.scriptPubKey.addresses < 1) {
-		logger.warning(`No addresses in output #${output.n} in transaction "${transaction.txid}"`, {object: output});
-	}
+	saveOutput(transaction.txid, output.n, output.value);
 
-	await runProcessorOnList(processAddress, output.scriptPubKey.addresses, output, transaction, block);
-
-	numOutputs++;
-
-	if (numOutputs % 1000 === 0) {
-		perfEmitter.emit('1000outputs');
-	}
+	return output.value;
 
 	logger.info4(`Done processing output #${output.n} in transaction ${transaction.txid}`);
-
-	return output.scriptPubKey.addresses;
 }
 
-async function processAddress (address, output, transaction, block) {
-	logger.info3(`Processing address ${address} in output #${output.n} in transaction ${transaction.txid}`);
+function getBlockSubsidy(height, subsidy=50) {
+	if (height > 210000) {
+		return getBlockSubsidy(height - 210000, subsidy/2);
+	} else {
+		return subsidy;
+	}
+}
 
+async function map (func, list, ...args) {
+	let ret;
+	if (commander.async) {
+		ret = await Promise.all(list.map((value) => func(value, ...args)));
+	} else {
+		ret = [];
+		for (let value of list) {
+			ret.push(await func(value, ...args));
+		}
+	}
+	return ret;
+}
+
+async function saveBlock(id, height, time, tx) {
+	const document = {
+		_key: id,
+		height: height,
+		time: time,
+		tx: tx
+	};
+
+	await saveDocument(BLOCKS, document);
+
+	blocksCounter++;
+	if (blocksCounter % 1000 === 0) {
+		logger.info(`1000 blocks in ${moment.duration(moment().diff(blocksLapTime)).asMilliseconds() / 1000} seconds`);
+		blocksLapTime = moment();
+		const newProgress = Math.round((height / bestBlockHeight) * 100)
+		if (newProgress > progress) {
+			logger.info(`Progress: ${height} (${Math.round((height / bestBlockHeight) * 100)}%)`);
+		}
+	}
+
+	return document;
+}
+
+async function saveTransaction(id, blockHash) {
+	const document = {
+		_key: id,
+		blockhash: blockHash
+	};
+
+	const ret = await saveDocument(TRANSACTIONS, document);
+
+	transactionsCounter++;
+	if (commander.perf && transactionsCounter % 1000 === 0) {
+		logger.info(`1000 transactions in ${moment.duration(moment().diff(transactionsLapTime)).asMilliseconds() / 1000} seconds`);
+		transactionsLapTime = moment();
+	}
+
+	return document;
+}
+
+async function saveOutput(transactionId, outputId, value) {
+	const document = {
+		_key: `${transactionId}:${outputId}`,
+		value: value
+	};
+
+	const ret = await saveDocument(OUTPUTS, document);
+
+	outputsCounter++;
+
+	return document;
+}
+
+
+async function saveAddress(address, transactionId, outputId) {
 	const document = {
 		_key: address,
-		[transaction.txid]: {
-			[output.n]: output.value
-		}
+		outputs: [`${transactionId}:${outputId}`]
 	};
 
 	await saveOrUpdateDocument(ADDRESSES, document);
-
-	numAddresses++;
-
-	logger.info4(`Done processing address ${address} in output #${output.n} in transaction ${transaction.txid}`);
 }
 
-async function runProcessorOnList (func, list, ...args) {
-	if (commander.async) {
-		await Promise.all(list.map((value) => func(value, ...args)));
-	} else {
-		for (let value of list) {
-			await func(value, ...args);
-		}
-	}
+async function saveOutputSpentIn(outputId, transactionId) {
+	const document = {
+		_key: outputId,
+		_from: `outputs/${outputId}`,
+		_to: `transactions/${transactionId}`
+	};
+
+	await saveDocument(OUTPUTS_SPENT_IN, document);
+
+	return document;
 }
 
 // const transactionStr = `
@@ -267,74 +349,59 @@ async function runProcessorOnList (func, list, ...args) {
 
 async function getOrCreateCollection (collection) {
 	try {
-		await collection.handle.get();
+		return await collection.handle.get();
 	} catch (error) {
 		logger.info(`Creating collection "${collection.name}"`);
 		try {
-			collection.handle.create();
+			return await collection.handle.create();
 		} catch (error) {
 			throw new MyError(`Creating collection "${collection.name}" failed`, {error});
 		}
 	}
 }
 
-// async function saveOrReplaceDocument (collection, document) {
-  // let query = `
-  //     UPSERT { _key: "${document._key}" }
-  //     INSERT ${JSON.stringify(document)}
-  //     REPLACE ${JSON.stringify(document)}
-  //     IN ${collection.name}
-  //     RETURN { type: OLD ? 'update' : 'insert' }
-  //     `
-  //   // logger.debug1('query', query)
-  //
-  // try {
-  //   let ret = await queryDatabase(5, query)
-  //   if (ret._result[0].type === 'update') {
-  //     logger.warning(`${collection.entity} "${document._key}" updated`)
-  //   }
-  //     // logger.debug1('ret', ret)
-  //     // return await saveDocument(collection, document)
-  // } catch (error) {
-  //   throw new MyError(`Creating ${collection.entity} "${document._key}" failed`, {error, document})
-  // }
-// }
-
-async function saveOrUpdateDocument (collection, document) {
-	let query = `
-    UPSERT { _key: "${document._key}" }
-    INSERT ${JSON.stringify(document)}
-    UPDATE ${JSON.stringify(document)}
-    IN ${collection.name}
-    RETURN { NEW: NEW, OLD: OLD, type: OLD ? 'update' : 'insert' }
-    `;
-
+async function getOrCreateGraph (graph) {
 	try {
-		let ret = await queryDatabase(commander.retries, query);
-		// if (ret._result[0].type === 'update') {
-		//   logger.warning(`${collection.entity} "${document._key}" updated`, {OLD: ret._result[0].OLD, NEW: ret._result[0].NEW})
-		// }
+		return await graph.handle.get();
 	} catch (error) {
-		logger.warning(`query: ${query}`);
-		logger.warning(`error code: ${error.code}, error: ${error}`);
-		throw new MyError(`Creating ${collection.entity} "${document._key}" failed`, {error, object: document});
+		if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_GRAPH_NOT_FOUND.code) {
+			logger.info(`Creating graph "${graph.name}"`);
+			try {
+				return await graph.handle.create(graph.properties);
+			} catch (error) {
+				throw new MyError(`Creating graph "${graph.name}" failed`, {error});
+			}
+		} else {
+			throw new MyError(`Getting graph ${graph.name} failed`, {error});
+		}
 	}
 }
 
-function countDocuments (collection) {
-	return collection.handle.count();
+async function countDocuments (collection) {
+	return await collection.handle.count();
 }
 
-// function getDocument (collection, documentId) {
-//   return collection.handle.document(documentId)
-// }
+async function getDocument (collection, documentId) {
+	try {
+		return await collection.handle[collection.get](documentId)
+	} catch (error) {
+		throw new MyError(`Getting ${collection.entity} "${documentId}" failed`, {error, object: documentId});
+	}
+}
 
 async function saveDocument (collection, document) {
 	try {
-		return await modifyCollection(commander.retries, collection, 'save', document);
+		return await _modifyCollection(commander.retries, collection, 'save', document);
 	} catch (error) {
 		if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_UNIQUE_CONSTRAINT_VIOLATED.code && !commander.dontOverwrite) {
-			logger.warning(`Saving ${collection.entity} "${document._key}" failed because it exists. Overwriting...`, {object: document});
+			let ret = await getDocument(collection, document._key);
+			delete ret._id;
+			delete ret._rev;
+			let object;
+			if (!_.isEqual(document, ret)) {
+				object = {object: {old: ret, new: document}}
+			}
+			logger.warning(`Saving ${collection.entity} "${document._key}" failed because it exists. Overwriting...`, object);
 			try {
 				return await replaceDocument(collection, document._key, document);
 			} catch (error) {
@@ -346,36 +413,81 @@ async function saveDocument (collection, document) {
 	}
 }
 
-async function replaceDocument (collection, documentId, document) {
-	return modifyCollection(commander.retries, collection, 'replace', documentId, document);
+async function saveOrUpdateDocument (collection, document) {
+	let query = `
+    UPSERT { _key: "${document._key}" }
+    INSERT ${JSON.stringify(document)}
+    UPDATE ${JSON.stringify(document)}
+    IN ${collection.name}
+    RETURN { NEW: NEW, OLD: OLD, type: OLD ? 'update' : 'insert' }
+    `;
+
+	try {
+		const ret = await queryDatabase(query);
+		// const result = await cursor.all()
+		// if (result[0].type === 'update') {
+		//   logger.warning(`${collection.entity} "${document._key}" updated`, {OLD: result[0].OLD, NEW: result[0].NEW})
+		// }
+		return ret;
+	} catch (error) {
+		// logger.warning(`query: ${query}`);
+		// logger.warning(`error code: ${error.code}, error: ${error}`);
+		throw new MyError(`Creating ${collection.entity} "${document._key}" failed`, {error, object: document});
+	}
+}
+
+// async function saveOrReplaceDocument (collection, document) {
+  // let query = `
+  //     UPSERT { _key: "${document._key}" }
+  //     INSERT ${JSON.stringify(document)}
+  //     REPLACE ${JSON.stringify(document)}
+  //     IN ${collection.name}
+  //     RETURN { type: OLD ? 'update' : 'insert' }
+  //     `
+  //
+  // try {
+  //   let ret = await queryDatabase(commander.retries, query)
+  // 	const result = await cursor.all()
+  //   if (result[0].type === 'update') {
+  //     logger.warning(`${collection.entity} "${document._key}" updated`)
+  //   }
+  //     // logger.debug1('ret', result)
+  //     // return await saveDocument(collection, document)
+  // } catch (error) {
+  //   throw new MyError(`Creating ${collection.entity} "${document._key}" failed`, {error, document})
+  // }
+// }
+
+async function replaceDocument (collection, documentId, document, ...args) {
+	return await _modifyCollection(commander.retries, collection, 'replace', documentId, document, ...args);
 }
 
 // function updateDocument (collection, documentId, document) {
 //   return modifyCollection(commander.retries, collection, 'update', documentId, document)
 // }
 
-async function queryDatabase (retries, query) {
+async function queryDatabase (query, retries=commander.retries) {
     // console.log(`modifyCollection(collection=${collection}, operation=${operation}, args=${args}`);
 	try {
 		return await db.query(query);
 	} catch (error) {
 		if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_CONFLICT.code && retries > 0) {
 			await setImmediatePromise();
-			return queryDatabase(retries - 1, query);
+			return await queryDatabase(query, retries - 1);
 		} else {
 			throw error;
 		}
 	}
 }
 
-async function modifyCollection (retries, collection, operation, ...args) {
-	// console.log(`modifyCollection(collection=${collection}, operation=${operation}, args=${args}`);
+async function _modifyCollection (retries, collection, operation, ...args) {
+	// logger.debug1('modifyCollection', {object: {args: args}});
 	try {
 		return await collection.handle[operation](...args);
 	} catch (error) {
 		if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_CONFLICT.code && retries > 0) {
 			await setImmediatePromise();
-			return modifyCollection(retries - 1, collection, operation, ...args);
+			return await modifyCollection(retries - 1, collection, operation, ...args);
 		} else {
 			throw error;
 		}
@@ -426,12 +538,11 @@ function handleExit (code) {
 		}
 	}
 
-	if (numBlocks + numTransactions + numOutputs > 0) {
+	if (blocksCounter + transactionsCounter + outputsCounter > 0) {
 		const duration = moment.duration(moment().diff(startTime));
-		logger.info(`Processed ${numBlocks} blocks, ` +
-			`${numTransactions} transactions, ` +
-			`${numOutputs} outputs and ` +
-			`${numAddresses} addresses in ` +
+		logger.info(`Processed ${blocksCounter} blocks, ` +
+			`${transactionsCounter} transactions, ` +
+			`${outputsCounter} outputs in ` +
 			`${moment.utc(duration.asMilliseconds()).format('HH:mm:ss')}`);
 	}
 }
