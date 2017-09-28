@@ -33,7 +33,7 @@ const logger = require('./logger')(commander.verbose, commander.debug);
 const unhandledRejections = new Map();
 
 const startTime = moment();
-let bestBlockHeight;
+let bestBlock;
 let progress = 0;
 let blocksCounter = 0;
 let blocksLapTime = moment();
@@ -55,18 +55,18 @@ const db = new Database({
 	databaseName: config.database.database
 });
 
-const BLOCKS = {
-	name: 'blocks',
-	entity: 'block',
-	handle: db.collection('blocks'),
+const ADDRESSES = {
+	name: 'addresses',
+	entity: 'address',
+	handle: db.collection('addresses'),
 	get: 'document'
 };
 
-const TRANSACTIONS = {
-	name: 'transactions',
-	entity: 'transaction',
-	handle: db.collection('transactions'),
-	get: 'document'
+const ADDRESSES_TO_OUTPUTS = {
+	name: 'addresses_to_outputs',
+	entity: 'addresses_to_outputs',
+	handle: db.edgeCollection('addresses_to_outputs'),
+	get: 'edge'
 };
 
 const OUTPUTS = {
@@ -76,18 +76,25 @@ const OUTPUTS = {
 	get: 'document'
 };
 
-const ADDRESSES = {
-	name: 'addresses',
-	entity: 'address',
-	handle: db.collection('addresses'),
+const OUTPUTS_TO_TRANSACTIONS = {
+	name: 'outputs_to_transactions',
+	entity: 'output_to_transaction',
+	handle: db.edgeCollection('outputs_to_transactions'),
+	get: 'edge'
+};
+
+const TRANSACTIONS = {
+	name: 'transactions',
+	entity: 'transaction',
+	handle: db.collection('transactions'),
 	get: 'document'
 };
 
-const OUTPUTS_SPENT_IN	 = {
-	name: 'outputsSpentIn',
-	entity: 'outputSpentIn',
-	handle: db.edgeCollection('outputsSpentIn'),
-	get: 'edge'
+const BLOCKS = {
+	name: 'blocks',
+	entity: 'block',
+	handle: db.collection('blocks'),
+	get: 'document'
 };
 
 const GRAPH = {
@@ -95,7 +102,11 @@ const GRAPH = {
 	handle: db.graph('graph'),
 	properties: {
 		edgeDefinitions: [{
-			collection: OUTPUTS_SPENT_IN.name,
+			collection: ADDRESSES_TO_OUTPUTS.name,
+			from: [ADDRESSES.name],
+			to: [OUTPUTS.name]
+		},{
+			collection: OUTPUTS_TO_TRANSACTIONS.name,
 			from: [OUTPUTS.name],
 			to: [TRANSACTIONS.name]
 		}]
@@ -109,16 +120,15 @@ const GRAPH = {
 		logger.info('Database cleaned');
 	} else {
 		await Promise.all([
-			getOrCreateCollection(BLOCKS),
-			getOrCreateCollection(TRANSACTIONS),
-			getOrCreateCollection(OUTPUTS),
-			// saveDocument(OUTPUTS, { _key: 'coinbase'} ),
 			getOrCreateCollection(ADDRESSES),
-			getOrCreateCollection(OUTPUTS_SPENT_IN)
+			getOrCreateCollection(ADDRESSES_TO_OUTPUTS),
+			getOrCreateCollection(OUTPUTS),
+			getOrCreateCollection(OUTPUTS_TO_TRANSACTIONS),
+			getOrCreateCollection(TRANSACTIONS),
+			getOrCreateCollection(BLOCKS),
 		]);
 		await getOrCreateGraph(GRAPH)
 
-		let block;
 		let blockHash;
 
 		if ((await countDocuments(BLOCKS)).count > 0) {
@@ -128,23 +138,24 @@ const GRAPH = {
 				'LIMIT 1 ' +
 				'RETURN b'
 			);
-			block = await cursor.next();
-			blockHash = block._key;
+			blockHash = (await cursor.next())._key;
 		} else {
-			block = {height: 1};
 			blockHash = await client.getBlockHash(1);
 		}
 
-		const bestBlock = await client.getBlock(await client.getBestBlockHash());
-		bestBlockHeight = bestBlock.height;
+		bestBlock = await client.getBlock(await client.getBestBlockHash());
+		let block = await client.getBlock(blockHash, 2);
 
-		logger.info(`Best block: ${bestBlockHeight}`);
-		logger.info(`Last known best block: ${block.height}`);
+		logger.info(`Best block: ${bestBlock.height}`);
+		logger.info(`Last known block: ${block.height}`);
+
+		let blockProcessedPromise;
 
 		while (!stop && blockHash) {
-			block = await client.getBlock(blockHash, 2);
-			await processBlock(block);
+			blockProcessedPromise = processBlock(block);
 			blockHash = block.nextblockhash ? block.nextblockhash : null;
+			block = await client.getBlock(blockHash, 2);
+			await blockProcessedPromise;
 		}
 	}
 })();
@@ -156,7 +167,7 @@ async function processBlock (block) {
 
 	await map(processTransaction, block.tx, block);
 
-	await saveBlock(block.hash, block.height, block.time, block.tx.map((tx) => tx.txid));
+	saveBlock(block.hash, block.height, block.time, block.tx.map((tx) => tx.txid));
 
 	logger.info4(`Done processing block #${block.height}`);
 }
@@ -164,9 +175,9 @@ async function processBlock (block) {
 async function processTransaction (transaction, block, index) {
 	logger.info2(`Processing transaction: ${transaction.txid}`);
 
-	const inputsValues = await map(processInput, transaction.vin, transaction, block);
+	map(processInput, transaction.vin, transaction, block);
 	// const inputsValue = inputsValues.reduce((total, value) => total + Math.round(1e8 * value));
-	const outputsValues = await map(processOutput, transaction.vout, transaction, block);
+	await map(processOutput, transaction.vout, transaction, block);
 	// const outputsValue = outputsValues.reduce((total, value) => total + Math.round(1e8 * value));
 
 	// logger.debug1(`inputsValue: ${inputsValues}`);
@@ -176,7 +187,7 @@ async function processTransaction (transaction, block, index) {
 	// 	logger.warning(`Transaction "${transaction.txid} is spending more (${outputsValue}) than is the sum of it's inputs (${inputsValue})`);
 	// }
 
-	await saveTransaction(transaction.txid, block.hash);
+	saveTransaction(transaction.txid, block.hash);
 
 	logger.info4(`Done processing transaction: ${transaction.txid}`);
 }
@@ -184,18 +195,20 @@ async function processTransaction (transaction, block, index) {
 async function processInput (input, transaction, block, index) {
 	logger.info3(`Processing input in transaction ${transaction.txid}`);
 
-	let output;
 	let outputId;
+	let value;
 	if (input.hasOwnProperty('coinbase')) {
 		if (index > 0) {
-			logger.warning(`Coinbase transaction in block "${block.hash}" not first transaction`);
+			logger.warning(`Coinbase transaction in block "${block.hash}" is not the first transaction`);
 		}
 		outputId = `${transaction.txid}:coinbase`;
-		output = await saveOutput(transaction.txid, 'coinbase', getBlockSubsidy(block.height));
+		value = getBlockSubsidy(block.height);
+		saveOutput(outputId, value);
 	} else {
 		outputId = `${input.txid}:${input.vout}`;
 		try {
-			output = await getDocument(OUTPUTS, outputId);
+			const output = await getDocument(OUTPUTS, outputId);
+			value = output.value
 		} catch (error) {
 			// logger.debug1(`processInput getDocument(${outputId}) failed with error: ${error.code}`, {error});
 			if (error.code === arangoErrors.ERROR_ARANGO_DOCUMENT_NOT_FOUND.code ||
@@ -208,9 +221,9 @@ async function processInput (input, transaction, block, index) {
 		}
 	}
 
-	await saveOutputSpentIn(outputId, transaction.txid);
+	saveOutputToTransaction(outputId, transaction.txid);
 
-	return output.value;
+	return value;
 
 	logger.info4(`Done processing input in transaction ${transaction.txid}`);
 }
@@ -222,13 +235,13 @@ async function processOutput (output, transaction, block, index) {
 		throw new MyError(`No scriptPubKey in output #${output.n} in transaction "${transaction.txid}"`, {object: output});
 	}
 
+	await saveOutput(`${transaction.txid}:${output.n}`, output.value);
+
 	if (output.scriptPubKey.hasOwnProperty('addresses') && output.scriptPubKey.addresses.length >= 1) {
 		map(saveAddress, output.scriptPubKey.addresses, transaction.txid, output.n);
-	} else {
+	} else if (output.scriptPubKey.type !== 'nonstandard') {
 		logger.warning(`No addresses in output #${output.n} in transaction "${transaction.txid}"`, {object: output});
 	}
-
-	await saveOutput(transaction.txid, output.n, output.value);
 
 	return output.value;
 
@@ -252,7 +265,7 @@ async function map (func, list, ...args) {
 	} else {
 		ret = []
 		for (let index = 0; index < list.length; index++) {
-			ret.push(await func(list[index], ...args), index);
+			ret.push(await func(list[index], ...args, index));
 		}
 	}
 	return ret;
@@ -266,26 +279,25 @@ async function saveBlock(id, height, time, tx) {
 		tx: tx
 	};
 
-	await saveDocument(BLOCKS, document);
+	const ret = await saveDocument(BLOCKS, document);
 
 	blocksCounter++;
 
-	const newProgress = Math.round((height / bestBlockHeight) * 100)
+	const newProgress = Math.round((height / bestBlock.height) * 100)
 	if (newProgress > progress) {
-		logger.info(`Progress: ${height}/${bestBlockHeight} (${Math.round((height / bestBlockHeight) * 100)}%)`);
+		logger.info(`Progress: ${height}/${bestBlock.height} (${Math.round((height / bestBlock.height) * 100)}%)`);
 		if (unhandledRejections.size > 0) {
 			logger.info(`Number of unhandled rejections: ${unhandledRejections.size}`);
 		}
 		progress = newProgress;
 	}
 
-	return document;
+	return ret;
 }
 
-async function saveTransaction(id, blockHash) {
+async function saveTransaction(transactionId) {
 	const document = {
-		_key: id,
-		blockhash: blockHash
+		_key: transactionId,
 	};
 
 	const ret = await saveDocument(TRANSACTIONS, document);
@@ -297,43 +309,51 @@ async function saveTransaction(id, blockHash) {
 		transactionsLapTime = moment();
 	}
 
-	return document;
+	return ret;
 }
 
-async function saveOutputSpentIn(outputId, transactionId) {
+async function saveOutput(outputId, value) {
 	const document = {
 		_key: outputId,
+		value: value
+	};
+
+	return await saveDocument(OUTPUTS, document);
+}
+
+async function saveOutputToTransaction(outputId, transactionId) {
+	const document = {
 		_from: `outputs/${outputId}`,
 		_to: `transactions/${transactionId}`
 	};
 
-	await saveDocument(OUTPUTS_SPENT_IN, document);
-
-	return document;
-}
-
-async function saveOutput(transactionId, outputId, value) {
-	const document = {
-		_key: `${transactionId}:${outputId}`,
-		value: value
-	};
-
-	const ret = await saveDocument(OUTPUTS, document);
-
-	return document;
+	return await saveDocument(OUTPUTS_TO_TRANSACTIONS, document);
 }
 
 async function saveAddress(address, transactionId, outputId) {
 	const document = {
-		_key: address,
-		outputs: [`${transactionId}:${outputId}`]
+		_key: address
 	};
 
-	await saveOrUpdateDocument(ADDRESSES, document);
+	try {
+		await saveDocument(ADDRESSES, document, true);
+	} catch (error) {
+		if (error.code !== arangoErrors.ERROR_ARANGO_UNIQUE_CONSTRAINT_VIOLATED.code) {
+			throw error;
+		}
+	}
 
-	return document;
+	saveAddressToOutput(address, `${transactionId}:${outputId}`);
 }
 
+async function saveAddressToOutput(address, outputId) {
+	const document = {
+		_from: `addresses/${address}`,
+		_to: `outputs/${outputId}`
+	};
+
+	return await saveDocument(ADDRESSES_TO_OUTPUTS, document);
+}
 
 // Frontend Database Logic
 
@@ -362,7 +382,7 @@ async function getOrCreateGraph (graph) {
 				throw new MyError(`Creating graph "${graph.name}" failed`, {error});
 			}
 		} else {
-			throw new MyError(`Getting graph ${graph.name} failed`, {error});
+			throw new MyError(`Getting graph "${graph.name}" failed`, {error});
 		}
 	}
 }
@@ -383,16 +403,20 @@ async function getDocument (collection, documentId) {
 	}
 }
 
-async function saveDocument (collection, document) {
+async function saveDocument (collection, document, dontOverwrite=false) {
 	try {
 		return await _modifyCollection(commander.retries, collection, 'save', document);
 	} catch (error) {
-		if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_UNIQUE_CONSTRAINT_VIOLATED.code && !commander.dontOverwrite) {
-			logger.warning(`Saving ${collection.entity} "${document._key}" failed because it exists. Overwriting...`, {object: document});
-			try {
-				return await _replaceDocument(collection, document._key, document);
-			} catch (error) {
-				throw new MyError(`Overwriting ${collection.entity} "${document._key}" failed`, {error, object: document});
+		if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_UNIQUE_CONSTRAINT_VIOLATED.code) {
+			if (!dontOverwrite && !commander.dontOverwrite) {
+				logger.warning(`Saving ${collection.entity} "${document._key}" failed because it exists. Overwriting...`);
+				try {
+					return await _replaceDocument(collection, document._key, document);
+				} catch (error) {
+					throw new MyError(`Overwriting ${collection.entity} "${document._key}" failed`, {error, object: document});
+				}
+			} else {
+				throw new MyError(`Saving ${collection.entity} "${document._key}" failed`, {error, object: document});
 			}
 		} else {
 			throw new MyError(`Saving ${collection.entity} "${document._key}" failed`, {error, object: document});
@@ -445,7 +469,7 @@ async function _modifyCollection (retries, collection, operation, ...args) {
 	} catch (error) {
 		if (error.isArangoError && error.errorNum === arangoErrors.ERROR_ARANGO_CONFLICT.code && retries > 0) {
 			await setImmediatePromise();
-			return await modifyCollection(retries - 1, collection, operation, ...args);
+			return await _modifyCollection(retries - 1, collection, operation, ...args);
 		} else {
 			throw error;
 		}
@@ -530,7 +554,7 @@ function handleExit (code) {
 	if (blocksCounter + transactionsCounter > 0) {
 		const duration = moment.duration(moment().diff(startTime));
 		logger.info(`Processed ${blocksCounter} blocks and ` +
-			`${transactionsCounter} transactions in` +
+			`${transactionsCounter} transactions in ` +
 			`${moment.utc(duration.asMilliseconds()).format('HH:mm:ss')}`);
 	}
 }

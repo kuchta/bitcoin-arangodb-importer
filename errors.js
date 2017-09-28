@@ -4,7 +4,11 @@ class MyError extends Error {
 		this.error = error;
 		this.object = object;
 		if (this.error) {
-			this.code = this.error.code;
+			if (this.error.isArangoError) {
+				this.code = this.error.errorNum;
+			} else {
+				this.code = this.error.code;
+			}
 		}
 	}
 
