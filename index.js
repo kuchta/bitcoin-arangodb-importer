@@ -55,6 +55,27 @@ const db = new Database({
 	databaseName: config.database.database
 });
 
+const BLOCKS = {
+	name: 'blocks',
+	entity: 'block',
+	handle: db.collection('blocks'),
+	get: 'document'
+};
+
+const TRANSACTIONS = {
+	name: 'transactions',
+	entity: 'transaction',
+	handle: db.collection('transactions'),
+	get: 'document'
+};
+
+const OUTPUTS = {
+	name: 'outputs',
+	entity: 'output',
+	handle: db.collection('outputs'),
+	get: 'document'
+};
+
 const ADDRESSES = {
 	name: 'addresses',
 	entity: 'address',
@@ -69,13 +90,6 @@ const ADDRESSES_TO_OUTPUTS = {
 	get: 'edge'
 };
 
-const OUTPUTS = {
-	name: 'outputs',
-	entity: 'output',
-	handle: db.collection('outputs'),
-	get: 'document'
-};
-
 const OUTPUTS_TO_TRANSACTIONS = {
 	name: 'outputs_to_transactions',
 	entity: 'output_to_transaction',
@@ -83,18 +97,11 @@ const OUTPUTS_TO_TRANSACTIONS = {
 	get: 'edge'
 };
 
-const TRANSACTIONS = {
-	name: 'transactions',
-	entity: 'transaction',
-	handle: db.collection('transactions'),
-	get: 'document'
-};
-
-const BLOCKS = {
-	name: 'blocks',
-	entity: 'block',
-	handle: db.collection('blocks'),
-	get: 'document'
+const TRANSACTIONS_TO_OUTPUTS = {
+	name: 'transactions_to_outputs',
+	entity: 'transaction_to_output',
+	handle: db.edgeCollection('transactions_to_outputs'),
+	get: 'edge'
 };
 
 const GRAPH = {
@@ -105,10 +112,14 @@ const GRAPH = {
 			collection: ADDRESSES_TO_OUTPUTS.name,
 			from: [ADDRESSES.name],
 			to: [OUTPUTS.name]
-		},{
+		}, {
 			collection: OUTPUTS_TO_TRANSACTIONS.name,
 			from: [OUTPUTS.name],
 			to: [TRANSACTIONS.name]
+		}, {
+			collection: TRANSACTIONS_TO_OUTPUTS.name,
+			from: [TRANSACTIONS.name],
+			to: [OUTPUTS.name]
 		}]
 	}
 };
@@ -120,12 +131,13 @@ const GRAPH = {
 		logger.info('Database cleaned');
 	} else {
 		await Promise.all([
+			getOrCreateCollection(BLOCKS),
+			getOrCreateCollection(TRANSACTIONS),
+			getOrCreateCollection(OUTPUTS),
 			getOrCreateCollection(ADDRESSES),
 			getOrCreateCollection(ADDRESSES_TO_OUTPUTS),
-			getOrCreateCollection(OUTPUTS),
 			getOrCreateCollection(OUTPUTS_TO_TRANSACTIONS),
-			getOrCreateCollection(TRANSACTIONS),
-			getOrCreateCollection(BLOCKS),
+			getOrCreateCollection(TRANSACTIONS_TO_OUTPUTS)
 		]);
 		await getOrCreateGraph(GRAPH)
 
@@ -210,22 +222,22 @@ async function processInput (input, transaction, block, index) {
 			const output = await getDocument(OUTPUTS, outputId);
 			value = output.value
 		} catch (error) {
-			// logger.debug1(`processInput getDocument(${outputId}) failed with error: ${error.code}`, {error});
-			if (error.code === arangoErrors.ERROR_ARANGO_DOCUMENT_NOT_FOUND.code ||
-					error.code === arangoErrors.ERROR_HTTP_NOT_FOUND.code) {
-				logger.warning(`Can't find output "${outputId}" referenced in input #${index} of transaction "${transaction.txid}"`);
-				return 0;
-			} else {
+			if (error.code !== arangoErrors.ERROR_ARANGO_DOCUMENT_NOT_FOUND.code &&
+					error.code !== arangoErrors.ERROR_HTTP_NOT_FOUND.code) {
 				throw error;
 			}
+			logger.warning(`Can't find output "${outputId}" referenced in input #${index} of transaction "${transaction.txid}"`);
+			value = 0;
 		}
 	}
 
-	saveOutputToTransaction(outputId, transaction.txid);
-
-	return value;
+	if (outputId) {
+		saveOutputToTransaction(outputId, transaction.txid);
+	}
 
 	logger.info4(`Done processing input in transaction ${transaction.txid}`);
+
+	return value;
 }
 
 async function processOutput (output, transaction, block, index) {
@@ -236,6 +248,7 @@ async function processOutput (output, transaction, block, index) {
 	}
 
 	await saveOutput(`${transaction.txid}:${output.n}`, output.value);
+	saveTransactionToOutput(transaction.txid, `${transaction.txid}:${output.n}`);
 
 	if (output.scriptPubKey.hasOwnProperty('addresses') && output.scriptPubKey.addresses.length >= 1) {
 		map(saveAddress, output.scriptPubKey.addresses, transaction.txid, output.n);
@@ -251,7 +264,7 @@ async function processOutput (output, transaction, block, index) {
 // Utility functions
 
 function getBlockSubsidy(height, subsidy=50) {
-	if (height > 210000) {
+	if (height >= 210000) {
 		return getBlockSubsidy(height - 210000, subsidy/2);
 	} else {
 		return subsidy;
@@ -321,15 +334,6 @@ async function saveOutput(outputId, value) {
 	return await saveDocument(OUTPUTS, document);
 }
 
-async function saveOutputToTransaction(outputId, transactionId) {
-	const document = {
-		_from: `outputs/${outputId}`,
-		_to: `transactions/${transactionId}`
-	};
-
-	return await saveDocument(OUTPUTS_TO_TRANSACTIONS, document);
-}
-
 async function saveAddress(address, transactionId, outputId) {
 	const document = {
 		_key: address
@@ -353,6 +357,24 @@ async function saveAddressToOutput(address, outputId) {
 	};
 
 	return await saveDocument(ADDRESSES_TO_OUTPUTS, document);
+}
+
+async function saveOutputToTransaction(outputId, transactionId) {
+	const document = {
+		_from: `outputs/${outputId}`,
+		_to: `transactions/${transactionId}`
+	};
+
+	return await saveDocument(OUTPUTS_TO_TRANSACTIONS, document);
+}
+
+async function saveTransactionToOutput(transactionId, outputId) {
+	const document = {
+		_from: `transactions/${transactionId}`,
+		_to: `outputs/${outputId}`
+	};
+
+	return await saveDocument(TRANSACTIONS_TO_OUTPUTS, document);
 }
 
 // Frontend Database Logic
