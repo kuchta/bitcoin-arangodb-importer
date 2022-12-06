@@ -1,3 +1,5 @@
+'use strict';
+
 const winston = require('winston');
 const moment = require('moment');
 
@@ -43,11 +45,24 @@ const config = {
 	]
 };
 
-function removeFirstLine (string) {
-	let lines = string.split('\n');
-	lines.splice(0, 1);
-	return lines.join('\n');
-}
+let logger = {
+	init: (verbose, debug) => {
+		const winstonLogger = new (winston.Logger)(config);
+	
+		for (let level in config.levels) {
+			let match = level.match(/(info|debug)(\d)/);
+			if (match) {
+				if ((match[1] === 'info' && verbose >= match[2]) || (match[1] === 'debug' && debug >= match[2])) {
+					logger[level] = logMessage(verbose, debug, winstonLogger, level);
+				} else {
+					logger[level] = () => null;
+				}
+			} else {
+				logger[level] = logMessage(verbose, debug, winstonLogger, level);
+			}
+		}
+	}
+};
 
 function logMessage (verbose, debug, logger, level) {
 	return (message, { error = null , object = null } = {}) => {
@@ -89,24 +104,10 @@ function logMessage (verbose, debug, logger, level) {
 	};
 }
 
-function getLogger (verbose, debug) {
-	const logger = new (winston.Logger)(config);
-	let log = {};
-
-	for (let level in config.levels) {
-		let match = level.match(/(info|debug)(\d)/);
-		if (match) {
-			if ((match[1] === 'info' && verbose >= match[2]) || (match[1] === 'debug' && debug >= match[2])) {
-				log[level] = logMessage(verbose, debug, logger, level);
-			} else {
-				log[level] = () => {
-				};
-			}
-		} else {
-			log[level] = logMessage(verbose, debug, logger, level);
-		}
-	}
-	return log;
+function removeFirstLine (string) {
+	let lines = string.split('\n');
+	lines.splice(0, 1);
+	return lines.join('\n');
 }
 
-module.exports = getLogger;
+module.exports = logger;

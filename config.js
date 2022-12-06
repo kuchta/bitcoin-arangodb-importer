@@ -3,13 +3,13 @@ const config = {
 		host: 'localhost',
 		port: 8529,
 		database: 'bitcoin',
-		username: 'username',
-		password: 'password'
+		username: 'kuchta',
+		password: 'studna58'
 	},
 	bitcoinRPC: {
 		host: 'localhost',
-		username: 'username',
-		password: 'password',
+		username: 'kuchta',
+		password: 'studna58',
 		timeout: 600000
 	}
 };

@@ -9,12 +9,13 @@
     "start": "node index.js -h"
   },
   "dependencies": {
-    "arangojs": "^5.7.0",
+    "arangojs": "^5.8.0",
     "bitcoin-core": "^1.2.0",
-    "commander": "^2.11.0",
-    "lodash": "^4.17.4",
-    "moment": "^2.18.1",
-    "winston": "^2.3.1"
+    "cluster-master": "^0.2.1",
+    "commander": "^2.20.3",
+    "moment": "^2.29.4",
+    "throng": "^4.0.0",
+    "winston": "^2.4.7"
   },
   "devDependencies": {
     "happiness": "^10.0.2"
